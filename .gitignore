@@ -1,0 +1,44 @@
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime data — DO NOT COMMIT
+logs/
+history/
+*.log
+*.log.*
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.vs/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Coverage / test artifacts
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
