@@ -1,0 +1,12 @@
+# What headless.py (the lo-cryptobot service) needs — no GUI, no data-science stack.
+#   python -m venv venv && venv/bin/pip install -r requirements-headless.txt
+# The desktop app (main.py) still uses requirements.txt.
+
+# Exchange API (market data, balances, orders)
+ccxt>=4.0.0
+
+# HTTP for the sentiment model; the code falls back to urllib without it
+requests>=2.31.0
+
+# Loads .env when run by hand; systemd passes the environment itself
+python-dotenv>=1.0.0
