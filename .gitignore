@@ -42,3 +42,6 @@ desktop.ini
 .mypy_cache/
 .ruff_cache/
 htmlcov/
+
+# Headless service state when run by hand (paper wallet, decision log)
+state/

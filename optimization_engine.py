@@ -12,9 +12,35 @@ Key improvements:
 import threading
 import time
 import random
+import re
 from typing import Dict, List, Optional, Tuple
 from collections import deque
 import logging
+
+
+# "BTC: 0.42", "**BTC**: +0.42", "- BTC: -0.3." — a ticker, a colon, the first number after it.
+_SCORE_LINE_RE = re.compile(r"^[^A-Za-z0-9]*([A-Za-z0-9]{2,15})[^A-Za-z0-9:]*:\s*\**\s*([-+]?\d*\.?\d+)")
+
+
+def parse_sentiment_lines(text: Optional[str]) -> Dict[str, float]:
+    """Parse "SYMBOL: SCORE" lines into {SYMBOL: score clamped to [-1, 1]}.
+
+    Lines that do not parse are skipped (never defaulted to 0.0), so the caller can tell a coin
+    the model scored from one it did not.
+    """
+    out: Dict[str, float] = {}
+    if not text:
+        return out
+    for line in text.splitlines():
+        m = _SCORE_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        try:
+            score = float(m.group(2))
+        except ValueError:
+            continue
+        out[m.group(1).upper()] = max(-1.0, min(1.0, score))
+    return out
 
 
 class RollingSentimentCache:
@@ -24,13 +50,20 @@ class RollingSentimentCache:
         self._lock = threading.Lock()
         self._data: Dict[str, Dict[str, float]] = {}  # coin -> {"score": float, "ts": float}
 
-    def set(self, coin: str, score: float, ts: Optional[float] = None):
-        """Store score with timestamp."""
+    def set(self, coin: str, score: float, ts: Optional[float] = None, placeholder: bool = False):
+        """Store score with timestamp. placeholder=True marks a stand-in, not a model score."""
         with self._lock:
             self._data[coin.upper()] = {
                 "score": float(score),
-                "ts": ts if ts is not None else time.time()
+                "ts": ts if ts is not None else time.time(),
+                "placeholder": bool(placeholder),
             }
+
+    def has_real_score(self, coin: str) -> bool:
+        """True once the model (not the scheduler's staggered seeding) has scored this coin."""
+        with self._lock:
+            row = self._data.get(coin.upper())
+            return bool(row) and not row.get("placeholder", False)
 
     def get(self, coin: str) -> Optional[float]:
         """Get score regardless of age."""
@@ -144,9 +177,14 @@ class SentimentRollingScheduler(threading.Thread):
         stagger_interval = self.ttl / len(self.coins)
 
         for i, coin in enumerate(self.coins):
+            # A real score from an earlier scheduler on the same cache (the headless service
+            # starts a new one on every start) is kept rather than reset to a placeholder.
+            has_real = getattr(self.cache, "has_real_score", None)
+            if callable(has_real) and has_real(coin):
+                continue
             # Set initial timestamp so coins expire at different times
             initial_ts = now - (self.ttl - (i * stagger_interval))
-            self.cache.set(coin, 0.0, initial_ts)
+            self.cache.set(coin, 0.0, initial_ts, placeholder=True)
 
         self.log.info(
             f"Initialized {len(self.coins)} coins with staggered refresh (spread over {self.ttl}s)"
@@ -262,29 +300,13 @@ class SentimentRollingScheduler(threading.Thread):
 
     def _parse_lines(self, text: str) -> Dict[str, float]:
         """Parse LLaMA response into {coin: score} dict."""
-        out: Dict[str, float] = {}
-        if not text:
-            return out
+        # Shared with the headless service's on-demand refresh. Tolerates the markdown and
+        # trailing punctuation instruction-tuned models add ("**BTC**: 0.42.").
+        return parse_sentiment_lines(text)
 
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-
-            parts = line.split(":", 1)
-            if len(parts) != 2:
-                continue
-
-            sym = parts[0].strip().upper()
-            try:
-                score = float(parts[1].strip())
-                # Clamp to [-1, 1]
-                score = max(-1.0, min(1.0, score))
-                out[sym] = score
-            except (ValueError, AttributeError):
-                continue
-
-        return out
+    def _wait(self, seconds: float) -> bool:
+        """Sleep, but wake as soon as stop is requested. Returns True when stopping."""
+        return self.stop_event.wait(max(0.0, seconds))
 
     def run(self):
         """Main scheduler loop with optimized timing."""
@@ -296,6 +318,9 @@ class SentimentRollingScheduler(threading.Thread):
 
         consecutive_errors = 0
         max_errors = 5
+        # generate() returns None (it does not raise) when the model is unreachable; without a
+        # back-off the stale coins are retried every few seconds for as long as it is down.
+        unreachable_streak = 0
 
         while not self.stop_event.is_set():
             try:
@@ -303,7 +328,7 @@ class SentimentRollingScheduler(threading.Thread):
                 if self._check_backpressure():
                     # Slow down temporarily
                     self.log.info("Applying backpressure: sleeping 5s")
-                    time.sleep(5.0)
+                    self._wait(5.0)
                     continue
 
                 # 2) Select coins to process
@@ -311,7 +336,7 @@ class SentimentRollingScheduler(threading.Thread):
 
                 # 3) If nothing needs refresh, idle briefly
                 if not targets:
-                    time.sleep(1.0)
+                    self._wait(1.0)
                     continue
 
                 # 4) Process batch
@@ -320,6 +345,13 @@ class SentimentRollingScheduler(threading.Thread):
 
                 # Call LLaMA (blocks on GPU)
                 raw_response = self.llama.generate(prompt)
+                if raw_response is None:
+                    unreachable_streak += 1
+                    backoff = min(120.0, 5.0 * (2 ** min(unreachable_streak - 1, 5)))
+                    self.log.debug(f"Model gave no answer; next try in {backoff:.0f}s")
+                    self._wait(backoff)
+                    continue
+                unreachable_streak = 0
 
                 inference_duration = time.time() - start_time
                 self._recent_durations.append(inference_duration)
@@ -355,7 +387,7 @@ class SentimentRollingScheduler(threading.Thread):
                 sleep_time = self._calculate_adaptive_sleep()
                 sleep_time = self._add_jitter(sleep_time)
 
-                time.sleep(sleep_time)
+                self._wait(sleep_time)
 
             except Exception as e:
                 consecutive_errors += 1
@@ -364,7 +396,7 @@ class SentimentRollingScheduler(threading.Thread):
                 # Exponential backoff on repeated errors
                 backoff = min(30.0, 2.0 ** consecutive_errors)
                 self.log.warning(f"Backing off {backoff:.1f}s after error #{consecutive_errors}")
-                time.sleep(backoff)
+                self._wait(backoff)
 
                 if consecutive_errors >= max_errors:
                     self.log.critical("Too many consecutive errors, stopping scheduler")

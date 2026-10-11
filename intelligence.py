@@ -42,13 +42,20 @@ import json
 import logging
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Protocol
 
-import ccxt  # type: ignore
+# Imported lazily-tolerant: the headless service and its tests build strategies around fake
+# exchanges, and nothing but ExchangeWrapper.connect() needs ccxt itself.
+try:
+    import ccxt  # type: ignore
+except ImportError:  # pragma: no cover - exercised only where ccxt is not installed
+    ccxt = None  # type: ignore
 
 try:
     import config  # type: ignore
@@ -229,6 +236,8 @@ class ExchangeWrapper:
     def connect(self) -> None:
         if self.client is not None:
             return
+        if ccxt is None:
+            raise RuntimeError("ccxt is not installed; run pip install -r requirements.txt (or requirements-headless.txt).")
         klass = getattr(ccxt, self.exchange_id)
         params: Dict[str, Any] = {
             "apiKey": self.api_key,
@@ -332,6 +341,10 @@ class TradeInstruction:
     amount: float
     price: Optional[float] = None
     order_type: str = "market"
+    # Why the strategy wants this trade, and the price it saw when it decided. Neither reaches
+    # the exchange: `price` stays the limit price (None for market orders).
+    reason: str = ""
+    ref_price: Optional[float] = None
 
 
 class BaseStrategy:
@@ -350,7 +363,80 @@ class BaseStrategy:
 # ======================================================================
 # LLaMA / Ollama client
 
+API_STYLES = ("ollama", "openai")
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def strip_reasoning(text: Optional[str]) -> str:
+    """Drop a reasoning model's <think>…</think> preamble and keep only the answer.
+
+    Qwen3-family models (the one llama-server runs on loserver among them) emit their thinking
+    inline unless the chat template is told not to, and the score parser would otherwise read
+    "BTC: 0.3" out of a sentence that was still weighing it.
+    """
+    if not text:
+        return ""
+    out = _THINK_BLOCK_RE.sub("", text)
+    low = out.lower()
+    # An opening tag with no closing one means the token budget ran out mid-thought: there is
+    # no answer after it.
+    start = low.find("<think>")
+    if start != -1:
+        out = out[:start]
+        low = low[:start]
+    # Some templates put the opening tag in the prompt, so only "</think>" appears.
+    end = low.rfind("</think>")
+    if end != -1:
+        out = out[end + len("</think>"):]
+    return out.strip()
+
+
+def extract_openai_text(data: Any) -> Optional[str]:
+    """The answer text of an OpenAI-style /chat/completions (or /completions) response.
+
+    Returns None when the response has no answer field at all (malformed, or an error object
+    with status 200), and "" when the model answered with nothing.
+    """
+    if not isinstance(data, dict):
+        return None
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    first = choices[0]
+    content: Any = None
+    message = first.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            # Content-parts form: [{"type": "text", "text": "..."}]
+            content = "".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+    if content is None:
+        content = first.get("text")
+    if not isinstance(content, str):
+        # A reasoning-only answer (content null, reasoning_content set) is not an answer: the
+        # scores, if any, are in the middle of the model's deliberation.
+        return "" if isinstance(message, dict) else None
+    return strip_reasoning(content)
+
+
+def _is_loopback_url(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
 class LlamaDecisionEngine:
+    """Resilient client for the sentiment model.
+
+    Two wire formats: Ollama's /api/generate (the default, unchanged) and the OpenAI-compatible
+    /v1/chat/completions that llama.cpp's llama-server speaks. ``generate`` never raises: it
+    returns the answer text, or None once ``max_retries`` attempts have failed, so a model that
+    is down (loserver's llama-server is not started at boot) is an ordinary state.
+    """
+
     def __init__(
         self,
         model_name: str,
@@ -361,6 +447,9 @@ class LlamaDecisionEngine:
         retry_backoff: Optional[float] = None,
         options: Optional[Dict[str, Any]] = None,
         keep_alive: Optional[str] = None,
+        api_style: Optional[str] = None,
+        api_key: Optional[str] = None,
+        disable_thinking: Optional[bool] = None,
     ) -> None:
         self.model_name = model_name
         self.base_url = (base_url or config.LLAMA_API_BASE_URL).rstrip("/")
@@ -372,47 +461,147 @@ class LlamaDecisionEngine:
         if options:
             self.options.update(options)
         self.keep_alive = keep_alive or getattr(config, "LLAMA_KEEP_ALIVE", "2h")
+        style = (api_style or getattr(config, "LLAMA_API_STYLE", "ollama") or "ollama").strip().lower()
+        if style not in API_STYLES:
+            raise ValueError(f"LLAMA_API_STYLE must be \"ollama\" or \"openai\", not \"{style}\".")
+        self.api_style = style
+        # Never logged, never part of any status or error text.
+        self._api_key = api_key if api_key is not None else getattr(config, "LLAMA_API_KEY", "")
+        self.disable_thinking = (
+            disable_thinking if disable_thinking is not None else bool(getattr(config, "LLAMA_DISABLE_THINKING", True))
+        )
         self.logger = logging.getLogger(self.__class__.__name__)
+        # A model that is down fails every few seconds; log the first failure of a streak at
+        # ERROR and the rest at DEBUG, so the journal shows one line per outage, not thousands.
+        self._failing = False
+        self.last_error: Optional[str] = None
+        # A proxy from the environment must never see traffic to a local model.
+        self._bypass_proxy = _is_loopback_url(self.base_url)
         # optional requests session
         self._session = None
         try:
             import requests  # type: ignore
             self._requests = requests
             self._session = requests.Session()
+            if self._bypass_proxy:
+                self._session.trust_env = False
         except Exception:
             self._requests = None
 
-    def generate(self, prompt: str) -> Optional[str]:
-        url = f"{self.base_url}/generate"
-        payload = {
+    # ---------- wire formats ----------
+    def _endpoint_and_payload(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
+        if self.api_style == "openai":
+            messages: List[Dict[str, str]] = []
+            if self.system_prompt:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            payload: Dict[str, Any] = {"model": self.model_name, "messages": messages, "stream": False}
+            # Ollama option names → their OpenAI equivalents; Ollama-only knobs (raw, mirostat,
+            # num_ctx…) have no meaning to an OpenAI server and are left out.
+            if "num_predict" in self.options:
+                payload["max_tokens"] = int(self.options["num_predict"])
+            for key in ("temperature", "top_p"):
+                if key in self.options:
+                    payload[key] = self.options[key]
+            if self.disable_thinking:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
+            return f"{self.base_url}/chat/completions", payload
+        return f"{self.base_url}/generate", {
             "model": self.model_name,
             "prompt": prompt,
             "stream": False,
             "options": self.options,
             "keep_alive": self.keep_alive,
         }
+
+    def _extract(self, data: Any) -> Optional[str]:
+        if self.api_style == "openai":
+            return extract_openai_text(data)
+        if not isinstance(data, dict) or "response" not in data:
+            return None
+        return strip_reasoning(data.get("response") or "")
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.api_style == "openai" and self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _opener(self):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})) if self._bypass_proxy else urllib.request.build_opener()
+
+    def _post_json(self, url: str, payload: Dict[str, Any]) -> Tuple[int, Any, str]:
+        """POST and return (status, parsed JSON or None, raw text)."""
+        if self._session is not None:
+            resp = self._session.post(url, json=payload, headers=self._headers(), timeout=self.request_timeout)
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            return resp.status_code, data, resp.text or ""
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=self._headers(), method="POST")
+        try:
+            with self._opener().open(req, timeout=self.request_timeout) as r:  # nosec - configured host
+                raw = r.read().decode("utf-8", "replace")
+                status = r.status
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace") if e.fp is not None else ""
+            status = e.code
+        try:
+            data = json.loads(raw) if raw.strip() else None
+        except ValueError:
+            data = None
+        return status, data, raw
+
+    def _note_failure(self, url: str, problem: str) -> None:
+        self.last_error = problem
+        if not self._failing:
+            self._failing = True
+            self.logger.error("LLaMA request to %s failed: %s", url, problem)
+        else:
+            self.logger.debug("LLaMA request to %s still failing: %s", url, problem)
+
+    def _note_success(self, url: str) -> None:
+        if self._failing:
+            self.logger.info("LLaMA at %s answers again", url)
+        self._failing = False
+        self.last_error = None
+
+    def generate(self, prompt: str) -> Optional[str]:
+        url, payload = self._endpoint_and_payload(prompt)
         attempt = 0
         while True:
             attempt += 1
             try:
-                if self._session is not None:
-                    resp = self._session.post(url, json=payload, timeout=self.request_timeout)
-                    if resp.status_code == 200:
-                        return resp.json().get("response", "")
-                    self.logger.error("LLaMA HTTP %s: %s", resp.status_code, resp.text[:200])
+                status, data, text = self._post_json(url, payload)
+                if status == 200:
+                    answer = self._extract(data)
+                    if answer is not None:
+                        self._note_success(url)
+                        return answer
+                    problem = "the server answered 200 without an answer field"
                 else:
-                    req = urllib.request.Request(
-                        url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
-                    )
-                    with urllib.request.urlopen(req, timeout=self.request_timeout) as r:  # nosec
-                        data = json.load(r)
-                        return data.get("response", "")
+                    # A non-200 is a failed attempt like any other. (It used to fall through
+                    # the retry loop without counting, spinning forever on a 404 or 500.)
+                    problem = f"HTTP {status}: {' '.join(text.split())[:200]}"
             except Exception as exc:
-                if attempt >= self.max_retries:
-                    self.logger.error("LLaMA request failed: %s", exc)
-                    return None
-                # capped exponential backoff
-                time.sleep(min(5.0, self.retry_backoff ** (attempt - 1)))
+                problem = str(exc) or type(exc).__name__
+            if attempt >= self.max_retries:
+                self._note_failure(url, problem)
+                return None
+            # capped exponential backoff
+            time.sleep(min(5.0, self.retry_backoff ** (attempt - 1)))
+
+    def ping(self, timeout: float = 2.0) -> bool:
+        """True when the model server answers its listing endpoint (Ollama /tags, OpenAI /models)."""
+        url = f"{self.base_url}/models" if self.api_style == "openai" else f"{self.base_url}/tags"
+        headers = {k: v for k, v in self._headers().items() if k != "Content-Type"}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with self._opener().open(req, timeout=timeout) as r:  # nosec - configured host
+                return 200 <= r.status < 300
+        except Exception:
+            return False
 
     # Friendly wrapper for structured asks if you need it later
     def ask(self, system_prompt: str, context: Dict[str, Any]) -> Any:
@@ -495,10 +684,20 @@ class LlamaHybridStrategy(BaseStrategy):
         self.min_sentiment_delta = min_sentiment_delta
         self.cooloff_seconds = cooldown_seconds
 
+        # The rolling cache main.py and headless.py pass in. It used to be accepted and dropped,
+        # so every cycle fell back to direct LLM calls instead of reading the scheduler's scores.
+        self.sentiment_cache = sentiment_cache
+
         # State
         self.positions: Dict[str, Dict[str, float]] = {}
         self.last_trade_time: Dict[str, float] = {}
         self._prev_scores: Dict[str, float] = {}
+        self.entry_prices: Dict[str, float] = {}
+        self.entry_times: Dict[str, datetime] = {}
+        # Latest per-coin signal, {coin: {coin, sentiment, trend, hybrid, action, at}}. Replaced
+        # as a whole each cycle (never mutated in place) so readers on other threads — the
+        # headless control API — always see one consistent cycle.
+        self.last_signals: Dict[str, Dict[str, Any]] = {}
 
         # Opportunistic scalper settings (from config with safe defaults)
         self.opp_enabled = bool(getattr(config, "OPP_ENABLED", True))
@@ -567,12 +766,6 @@ class LlamaHybridStrategy(BaseStrategy):
             # Fallback to single timeframe if multi-TF fails
             self.logger.debug(f"Multi-TF failed for {coin}, using single TF")
             return self._trend_score(coin)
-
-        # Weighted average across timeframes
-        weighted_sum = sum(s * w for s, w in scores)
-        weight_total = sum(w for _, w in scores)
-
-        return weighted_sum / weight_total if weight_total > 0 else None
 
         # Weighted average across timeframes
         weighted_sum = sum(s * w for s, w in scores)
@@ -919,7 +1112,7 @@ class LlamaHybridStrategy(BaseStrategy):
         return "\n".join(context_lines)
 
     # ---------- trade I/O ----------
-    def _execute_buy(self, coin: str, notional_usd: float, price: float, out: List[TradeInstruction]) -> bool:
+    def _execute_buy(self, coin: str, notional_usd: float, price: float, out: List[TradeInstruction], reason: str = "") -> bool:
         try:
             market = f"{coin}/{self.base_currency}"
             # min notional heuristic
@@ -934,7 +1127,8 @@ class LlamaHybridStrategy(BaseStrategy):
                 self.logger.info("BUY %s skipped: notional $%.2f < $%.2f", coin, notional_usd, min_notional)
                 return False
             qty = notional_usd / price
-            if self.use_convert and self.convert_client is not None:
+            # Convert executes immediately and bypasses TradingBot, so it is a live-only route.
+            if self.use_convert and self.convert_client is not None and not self.simulate_only:
                 try:
                     q = self.convert_client.get_quote(self.base_currency, coin, from_amount=notional_usd)
                     qid = q.get("quoteId") if isinstance(q, dict) else None
@@ -943,7 +1137,8 @@ class LlamaHybridStrategy(BaseStrategy):
                         return True
                 except Exception as exc:
                     self.logger.error("Convert buy failed for %s: %s", coin, exc)
-            out.append(TradeInstruction(symbol=market, side="buy", amount=qty, order_type="market"))
+            out.append(TradeInstruction(symbol=market, side="buy", amount=qty, order_type="market",
+                                        reason=reason, ref_price=price))
             return True
         except Exception as exc:
             self.logger.error("BUY failed for %s: %s", coin, exc)
@@ -965,7 +1160,7 @@ class LlamaHybridStrategy(BaseStrategy):
             if amount * price < min_notional:
                 self.logger.info("SELL %s skipped: notional $%.2f < $%.2f", coin, amount * price, min_notional)
                 return False
-            if self.use_convert and self.convert_client is not None:
+            if self.use_convert and self.convert_client is not None and not self.simulate_only:
                 try:
                     q = self.convert_client.get_quote(coin, self.base_currency, from_amount=amount)
                     qid = q.get("quoteId") if isinstance(q, dict) else None
@@ -974,11 +1169,127 @@ class LlamaHybridStrategy(BaseStrategy):
                         return True
                 except Exception as exc:
                     self.logger.error("Convert sell failed for %s: %s", coin, exc)
-            out.append(TradeInstruction(symbol=market, side="sell", amount=amount, order_type="market"))
+            out.append(TradeInstruction(symbol=market, side="sell", amount=amount, order_type="market",
+                                        reason=reason, ref_price=price))
             return True
         except Exception as exc:
             self.logger.error("SELL failed for %s: %s", coin, exc)
             return False
+
+    # ---------- scoring, signals and position tracking ----------
+    def _compute_hybrid_score(self, coin: str, sentiment: Optional[float], trend: Optional[float]) -> float:
+        """Blend sentiment and trend into one score in [-1, 1]. Missing inputs count as neutral."""
+        s = float(sentiment or 0.0)
+        t = float(trend or 0.0)
+        self.logger.debug(f"{coin}: sentiment={s:.2f}, trend={t:.2f}")
+
+        # A strong component gets the larger weight; otherwise the configured split applies.
+        if abs(t) > 0.7:
+            w_trend, w_sent = 0.6, 0.4
+        elif abs(s) > 0.7:
+            w_trend, w_sent = 0.4, 0.6
+        else:
+            w_trend = self.trend_weight
+            w_sent = self.sentiment_weight
+
+        sc = round(max(-1.0, min(1.0, w_sent * s + w_trend * t)), 3)
+
+        # Disagreement between the two lowers confidence.
+        if (s > 0 and t < 0) or (s < 0 and t > 0):
+            confidence_penalty = 0.3 * min(abs(s), abs(t))
+            sc *= (1.0 - confidence_penalty)
+        return sc
+
+    def _signal_action(self, hybrid: float, trend: Optional[float]) -> str:
+        """What the score says to do, before funds, cooldowns and holdings are considered."""
+        if hybrid >= self.buy_threshold:
+            if self.require_trend_confirmation and trend is not None and trend < 0:
+                return "hold"
+            return "buy"
+        if hybrid <= self.sell_threshold:
+            return "sell"
+        return "hold"
+
+    def _sentiment_known(self, coin: str, sentiment: Dict[str, float]) -> bool:
+        """False when the sentiment used for a coin is only a stand-in for "no score yet".
+
+        The rolling scheduler seeds the cache with 0.0 placeholders to stagger its first
+        refreshes; those are neutral inputs to the blend but must not be reported as the model's
+        opinion.
+        """
+        if coin not in sentiment:
+            return False
+        cache = getattr(self, "sentiment_cache", None)
+        has_real = getattr(cache, "has_real_score", None)
+        if cache is not None and callable(has_real):
+            return bool(has_real(coin))
+        return True
+
+    def _record_signals(
+        self,
+        coins: List[str],
+        sentiment: Dict[str, float],
+        trends: Dict[str, Optional[float]],
+        hybrids: Dict[str, float],
+    ) -> None:
+        now_ms = int(time.time() * 1000)
+        fresh: Dict[str, Dict[str, Any]] = {}
+        for coin in coins:
+            if coin not in hybrids:
+                continue
+            trend = trends.get(coin)
+            fresh[coin] = {
+                "coin": coin,
+                "sentiment": float(sentiment[coin]) if self._sentiment_known(coin, sentiment) else None,
+                "trend": round(float(trend), 4) if trend is not None else None,
+                "hybrid": round(float(hybrids[coin]), 4),
+                "action": self._signal_action(hybrids[coin], trend),
+                "at": now_ms,
+            }
+        merged = dict(self.last_signals)
+        merged.update(fresh)
+        self.last_signals = merged
+
+    def _check_stop_loss(self, coin: str, current_price: float) -> bool:
+        """The basic hybrid has no stop-loss; DiversifiedPortfolioStrategy overrides this."""
+        return False
+
+    def _check_time_exit(self, coin: str) -> bool:
+        """The basic hybrid has no time exit; DiversifiedPortfolioStrategy overrides this."""
+        return False
+
+    def _cleanup_position(self, coin: str) -> None:
+        """Clean up tracking data after exit."""
+        self.positions.pop(coin, None)
+        self.entry_prices.pop(coin, None)
+        self.entry_times.pop(coin, None)
+
+    def _execute_buy_with_tracking(self, coin: str, amount: float, trades: List[TradeInstruction], reason: str = "") -> None:
+        """Queue a buy of `amount` (in the base currency) and track its entry price and time."""
+        current_price = self._get_current_price(coin)
+        if not current_price:
+            return
+
+        min_trade = float(getattr(config, "MIN_TRADE_USD", 10.0))
+        if amount < min_trade:
+            return
+
+        success = self._execute_buy(coin, amount, current_price, trades, reason=reason)
+        if success:
+            # Track entry for risk management
+            self.entry_prices[coin] = current_price
+            self.entry_times[coin] = datetime.now(timezone.utc)
+
+            self.positions[coin] = {
+                "entry_price": current_price,
+                "amount": amount / current_price,
+                "entry_time": self.entry_times[coin].isoformat()
+            }
+            self.last_trade_time[coin] = time.time()
+
+            core = getattr(self, "core_coins", None)
+            coin_type = "CORE" if core is None or coin in core else "OPPORTUNISTIC"
+            self.logger.info(f"[{coin_type}] Bought {coin} at ${current_price:.4f}")
 
     # ---------- core decision ----------
     def decide_trades(self, balances: Dict[str, Dict[str, float]], **kwargs) -> List[TradeInstruction]:
@@ -995,16 +1306,16 @@ class LlamaHybridStrategy(BaseStrategy):
         has_cache = getattr(self, "sentiment_cache", None) is not None
         self.logger.debug(f"Sentiment cache available: {has_cache}")
 
-        # Get trend scores using parent method
+        # Trend per coin; None when the exchange had no usable candles.
         trend_scores: Dict[str, Optional[float]] = {}
         for coin in coins:
             trend_scores[coin] = self._multi_timeframe_trend(coin)
 
-        # Get sentiment from cache or direct call (parent handles this)
+        # Get sentiment from cache or direct call
         sent: Dict[str, float] = {}
         need: List[str] = []
 
-        if getattr(self, "sentiment_cache", None):
+        if has_cache:
             ttl = getattr(config, "SENTIMENT_TTL_SECONDS", 900)
             cache_hits = 0
             cache_misses = 0
@@ -1014,7 +1325,7 @@ class LlamaHybridStrategy(BaseStrategy):
                 if s is None:
                     cache_misses += 1
                     # Only query AI if trend is significant or cache is stale
-                    if abs(trend_scores.get(c, 0.0)) > 0.2:
+                    if abs(trend_scores.get(c) or 0.0) > 0.2:
                         need.append(c)
                 else:
                     cache_hits += 1
@@ -1028,8 +1339,8 @@ class LlamaHybridStrategy(BaseStrategy):
         else:
             # No cache - query all coins with significant trends OR fallback to all
             self.logger.warning("No sentiment cache - using direct AI calls")
-            need = [c for c in coins if abs(trend_scores.get(c, 0.0)) > 0.2]
-            if not need and not trend_scores:
+            need = [c for c in coins if abs(trend_scores.get(c) or 0.0) > 0.2]
+            if not need and not any(v is not None for v in trend_scores.values()):
                 need = coins[:]
 
         if need:
@@ -1042,41 +1353,17 @@ class LlamaHybridStrategy(BaseStrategy):
                 sent_str = ", ".join(f"{k}={v:.2f}" for k, v in fetched.items())
                 self.logger.info(f"Fetched sentiments: {sent_str}")
 
-        # Compute hybrid scores using parent logic
-        hybrid_scores: Dict[str, float] = {}
-        for coin in coins:
-            s = float(sent.get(coin, 0.0))
-            t = float(trend_scores.get(coin, 0.0))
-
-            # 🔹 DEBUG: Log individual components
-            self.logger.debug(f"{coin}: sentiment={s:.2f}, trend={t:.2f}")
-
-            # Use parent's weighting logic
-            trend_strength = abs(t)
-            sentiment_strength = abs(s)
-
-            if trend_strength > 0.7:
-                w_trend, w_sent = 0.6, 0.4
-            elif sentiment_strength > 0.7:
-                w_trend, w_sent = 0.4, 0.6
-            else:
-                w_trend = self.trend_weight
-                w_sent = self.sentiment_weight
-
-            sc = round(max(-1.0, min(1.0, w_sent * s + w_trend * t)), 3)
-
-            if (s > 0 and t < 0) or (s < 0 and t > 0):
-                confidence_penalty = 0.3 * min(abs(s), abs(t))
-                sc *= (1.0 - confidence_penalty)
-
-            hybrid_scores[coin] = sc
+        hybrid_scores: Dict[str, float] = {
+            coin: self._compute_hybrid_score(coin, sent.get(coin), trend_scores.get(coin)) for coin in coins
+        }
+        self._record_signals(coins, sent, trend_scores, hybrid_scores)
 
         # 🔹 CHANGE: Log hybrid scores (sentiment+trend), not just trend
         coin_summaries = []
         for coin in coins:
             if coin in hybrid_scores:
                 s = sent.get(coin, 0.0)
-                t = trend_scores.get(coin, 0.0)
+                t = trend_scores.get(coin) or 0.0
                 h = hybrid_scores[coin]
                 # Format: COIN [S:+0.50 T:+0.30 H:+0.42]
                 coin_summaries.append(f"{coin} [S:{s:+.2f} T:{t:+.2f} H:{h:+.2f}]")
@@ -1100,20 +1387,20 @@ class LlamaHybridStrategy(BaseStrategy):
 
             # Check stop-loss
             if self._check_stop_loss(coin, current_price):
-                self._execute_sell(coin, held, trades, "stop-loss")
+                self._execute_sell(coin, held, "stop-loss", trades)
                 self._cleanup_position(coin)
                 continue
 
             # Check time exit
             if self._check_time_exit(coin):
-                self._execute_sell(coin, held, trades, "time-limit")
+                self._execute_sell(coin, held, "time-limit", trades)
                 self._cleanup_position(coin)
                 continue
 
             # Regular sell signal
             hybrid = hybrid_scores.get(coin, 0.0)
             if hybrid <= self.sell_threshold and self._can_trade(coin):
-                self._execute_sell(coin, held, trades, f"hybrid={hybrid:.2f}")
+                self._execute_sell(coin, held, f"hybrid={hybrid:+.2f} <= sell threshold {self.sell_threshold:+.2f}", trades)
                 self._cleanup_position(coin)
 
         # BUY logic with portfolio allocation
@@ -1143,15 +1430,16 @@ class LlamaHybridStrategy(BaseStrategy):
         if core_candidates:
             core_candidates.sort(key=lambda x: x[1], reverse=True)
             top_coin, top_score = core_candidates[0]
+            reason = f"hybrid={top_score:+.2f} >= buy threshold {self.buy_threshold:+.2f} (core)"
 
             if self.require_trend_confirmation:
                 trend = trend_scores.get(top_coin)
                 if trend is not None and trend < 0:
                     self.logger.info(f"Skipping {top_coin}: negative trend")
                 else:
-                    DiversifiedPortfolioStrategy._execute_buy_with_tracking(top_coin, core_funds, trades)
+                    self._execute_buy_with_tracking(top_coin, core_funds, trades, reason=reason)
             else:
-                DiversifiedPortfolioStrategy._execute_buy_with_tracking(top_coin, core_funds, trades)
+                self._execute_buy_with_tracking(top_coin, core_funds, trades, reason=reason)
 
         # Buy best opportunistic coin (smaller position)
         if opportunistic_candidates:
@@ -1162,7 +1450,10 @@ class LlamaHybridStrategy(BaseStrategy):
             if trend is not None and trend < 0:
                 self.logger.info(f"Skipping {top_coin}: negative trend (opportunistic)")
             else:
-                DiversifiedPortfolioStrategy._execute_buy_with_tracking(top_coin, opportunistic_funds, trades)
+                self._execute_buy_with_tracking(
+                    top_coin, opportunistic_funds, trades,
+                    reason=f"hybrid={top_score:+.2f} >= buy threshold {self.buy_threshold:+.2f} (opportunistic)",
+                )
 
         return trades
 
@@ -1200,12 +1491,17 @@ class LlamaHybridStrategy(BaseStrategy):
             return 0.0
         return 0.0
 
-    def run_opportunistic_cycle(self, base_currency: str = "USDT", simulate_only: bool = False):
+    def run_opportunistic_cycle(self, base_currency: str = "USDT", simulate_only: Optional[bool] = None):
         """
         Opens/maintains tiny scalps on opportunistic_coins:
         - enter if: spread small, tiny momentum up, no cooldown, free slot
         - exit if: TP or SL hit (fee-aware)
+
+        simulate_only defaults to the strategy's own flag. (It used to default to False, so a
+        caller that forgot the argument placed real orders from a simulating strategy.)
         """
+        if simulate_only is None:
+            simulate_only = self.simulate_only
         if not self.opp_enabled:
             return []
 
@@ -1481,7 +1777,13 @@ class TradingBot:
     """Periodically runs a strategy; places market/convert orders.
 
     simulate_only=True → returns instructions but doesn't place orders.
+
+    Every cycle's trades are also kept as plain "decision" dicts (``last_cycle_decisions`` and
+    the ``decisions`` ring buffer) so status surfaces — the GUI, the headless control API — can
+    show what the bot decided without re-deriving it from logs.
     """
+    MAX_DECISIONS = 500
+
     def __init__(
         self,
         exchange: ExchangeWrapper,
@@ -1494,122 +1796,49 @@ class TradingBot:
         self.base_currency = base_currency
         self.simulate_only = simulate_only
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.decisions: "deque[Dict[str, Any]]" = deque(maxlen=self.MAX_DECISIONS)
+        self.last_cycle_decisions: List[Dict[str, Any]] = []
+        self.cycles = 0
+        self.last_cycle_at: Optional[int] = None  # epoch ms
 
-
-    def _place(self, t: TradeInstruction) -> None:
+    def _place(self, t: TradeInstruction) -> Optional[str]:
+        """Place one order; returns None on success or the failure as text."""
         try:
             self.exchange.create_order(t.symbol, t.side, t.amount, t.price, t.order_type)
+            return None
         except Exception as exc:
             self.logger.error("Order failed %s %s: %s", t.side, t.symbol, exc)
+            return str(exc) or type(exc).__name__
+
+    def _decision(self, t: TradeInstruction, at_ms: int, error: Optional[str]) -> Dict[str, Any]:
+        reason = t.reason or ""
+        if error:
+            reason = f"{reason}; order failed: {error}" if reason else f"order failed: {error}"
+        price = t.ref_price if t.ref_price is not None else t.price
+        return {
+            "at": at_ms,
+            "coin": t.symbol.split("/", 1)[0].upper(),
+            "side": t.side,
+            "amount": float(t.amount),
+            "price": float(price) if price is not None else None,
+            "simulated": bool(self.simulate_only),
+            "reason": reason,
+        }
 
     def run_cycle(self) -> List[TradeInstruction]:
         balances = self.exchange.get_balances()
         trades = self.strategy.decide_trades(balances)
+        errors: List[Optional[str]] = [None] * len(trades or [])
         if not self.simulate_only and trades:
-            for t in trades:
-                self._place(t)
+            errors = [self._place(t) for t in trades]
+        at_ms = int(time.time() * 1000)
+        decisions = [self._decision(t, at_ms, err) for t, err in zip(trades or [], errors)]
+        self.last_cycle_decisions = decisions
+        self.decisions.extend(decisions)
+        self.cycles += 1
+        self.last_cycle_at = at_ms
         self.strategy.on_cycle_end({"balances": balances, "trades": trades, "at": datetime.now(timezone.utc).isoformat()})
         return trades
-
-    def run(self):
-        """Main scheduler loop with optimized timing."""
-        self.log.info(
-            f"Sentiment scheduler started: {len(self.coins)} coins, "
-            f"target QPS={self.target_qps:.2f}, batch={self.batch}, "
-            f"TTL={self.ttl}s, strategy={self.rotate}"
-        )
-
-        consecutive_errors = 0
-        max_errors = 5
-
-        while not self.stop_event.is_set():
-            try:
-                # 1) Check for backpressure
-                if self._check_backpressure():
-                    # Slow down temporarily
-                    self.log.info("Applying backpressure: sleeping 5s")
-                    time.sleep(5.0)
-                    continue
-
-                # 2) Select coins to process
-                targets = self._select_next_batch()
-
-                # 3) If nothing needs refresh, idle briefly
-                if not targets:
-                    # 🔹 DEBUG: Show why nothing was selected
-                    staleness = self.cache.get_staleness_map()
-                    if staleness:
-                        oldest_coin = max(staleness.items(), key=lambda x: x[1])
-                        self.log.debug(
-                            f"No coins need refresh yet. Oldest: {oldest_coin[0]} "
-                            f"({oldest_coin[1]:.0f}s old, threshold: {self.ttl * 0.8:.0f}s)"
-                        )
-                    time.sleep(1.0)
-                    continue
-
-                # 4) Process batch
-                start_time = time.time()
-                prompt = self._build_prompt(targets)
-
-                # 🔹 DEBUG: Log what we're asking
-                self.log.debug(f"Querying AI for: {', '.join(targets)}")
-
-                # Call LLaMA (blocks on GPU)
-                raw_response = self.llama.generate(prompt)
-
-                # 🔹 DEBUG: Log raw response
-                if raw_response:
-                    preview = raw_response[:200].replace('\n', ' ')
-                    self.log.debug(f"AI response preview: {preview}...")
-
-                inference_duration = time.time() - start_time
-                self._recent_durations.append(inference_duration)
-                self._request_times.append(time.time())
-
-                # 5) Parse and cache results
-                scores = self._parse_lines(raw_response)
-
-                cached_count = 0
-                for coin in targets:
-                    if coin in scores:
-                        self.cache.set(coin, scores[coin])
-                        cached_count += 1
-
-                if cached_count > 0:
-                    coins_str = ", ".join(f"{c}:{scores.get(c, 0):.2f}" for c in targets if c in scores)
-                    self.log.info(
-                        f"✅ Updated {cached_count}/{len(targets)} coins in {inference_duration:.2f}s: {coins_str}"
-                    )
-                else:
-                    # 🔹 DEBUG: Log parse failure
-                    self.log.warning(
-                        f"❌ Failed to parse any scores from {len(targets)} coins. "
-                        f"Raw response length: {len(raw_response or '')}"
-                    )
-
-                # Reset error counter on success
-                consecutive_errors = 0
-
-                # 6) Adaptive sleep with jitter
-                sleep_time = self._calculate_adaptive_sleep()
-                sleep_time = self._add_jitter(sleep_time)
-
-                time.sleep(sleep_time)
-
-            except Exception as e:
-                consecutive_errors += 1
-                self.log.error(f"Scheduler error: {e}", exc_info=True)  # ← Full traceback
-
-                # Exponential backoff on repeated errors
-                backoff = min(30.0, 2.0 ** consecutive_errors)
-                self.log.warning(f"Backing off {backoff:.1f}s after error #{consecutive_errors}")
-                time.sleep(backoff)
-
-                if consecutive_errors >= max_errors:
-                    self.log.critical("Too many consecutive errors, stopping scheduler")
-                    break
-
-        self.log.info("Sentiment scheduler stopped")
 
 
 __all__ = [
@@ -1622,4 +1851,6 @@ __all__ = [
     "fetch_live_usd_rates",
     "update_usd_rates_batch",
     "TradingBot",
+    "extract_openai_text",
+    "strip_reasoning",
 ]

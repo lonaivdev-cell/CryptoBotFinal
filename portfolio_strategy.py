@@ -5,6 +5,7 @@ import time
 from typing import Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 
+import config
 from intelligence import LlamaHybridStrategy, TradeInstruction
 
 
@@ -79,6 +80,27 @@ class DiversifiedPortfolioStrategy(LlamaHybridStrategy):
 
         return False
 
+    def _get_sentiment_scores(self, coins: List[str]) -> Dict[str, float]:
+        """Sentiment for every coin: the rolling cache when there is one, else direct LLM calls.
+
+        A coin with no score yet gets 0.0 (neutral) so it is still judged on its trend; the
+        signals record says which scores were real.
+        """
+        coins = [c for c in coins if c.upper() != self.base_currency]
+        cache = getattr(self, "sentiment_cache", None)
+        if cache is None:
+            return self._get_sentiment(coins)
+        ttl = getattr(config, "SENTIMENT_TTL_SECONDS", 900)
+        scores: Dict[str, float] = {}
+        for coin in coins:
+            value = cache.get_fresh(coin, ttl)
+            if value is None:
+                # Stale beats nothing: the scheduler refreshes stalest-first, so an old score
+                # is about to be replaced, and it is still the model's last word on the coin.
+                value = cache.get(coin)
+            scores[coin] = float(value) if value is not None else 0.0
+        return scores
+
     def decide_trades(self, balances: Dict[str, Dict[str, float]], **kwargs) -> List[TradeInstruction]:
         """Trading logic with portfolio allocation and risk management."""
         if not self.coins:
@@ -90,17 +112,13 @@ class DiversifiedPortfolioStrategy(LlamaHybridStrategy):
             self.logger.info("No sentiment data available")
             return []
 
-        # Get trend scores
-        from concurrent.futures import as_completed
-        futures = {
-            self.executor.submit(self._get_trend_score, coin): coin
-            for coin in sentiment_scores.keys()
-        }
+        # Trend scores, one coin after another: ccxt's synchronous client and its rate limiter
+        # are not meant to be shared across threads, and the 60 s trend cache makes most of
+        # these lookups free anyway.
         trend_scores: Dict[str, Optional[float]] = {}
-        for fut in as_completed(futures):
-            coin = futures[fut]
+        for coin in sentiment_scores.keys():
             try:
-                trend_scores[coin] = fut.result()
+                trend_scores[coin] = self._multi_timeframe_trend(coin)
             except Exception:
                 trend_scores[coin] = None
 
@@ -110,12 +128,13 @@ class DiversifiedPortfolioStrategy(LlamaHybridStrategy):
             trend = trend_scores.get(coin)
             hybrid = self._compute_hybrid_score(coin, sentiment, trend)
             hybrid_scores[coin] = hybrid
+        self._record_signals(list(sentiment_scores.keys()), sentiment_scores, trend_scores, hybrid_scores)
 
         # Log scores
         coin_summaries = []
         for coin in self.coins:
             if coin in hybrid_scores:
-                trend = trend_scores.get(coin, 0.0)
+                trend = trend_scores.get(coin) or 0.0
                 coin_summaries.append(f"{coin} {trend:+.2f}")
         self.logger.info(" | ".join(coin_summaries))
 
@@ -135,25 +154,29 @@ class DiversifiedPortfolioStrategy(LlamaHybridStrategy):
 
             # Check stop-loss
             if self._check_stop_loss(coin, current_price):
-                self._execute_sell(coin, held, trades, "stop-loss")
+                entry = self.entry_prices.get(coin)
+                drop = f" ({(current_price - entry) / entry:+.1%} from entry)" if entry else ""
+                self._execute_sell(coin, held, f"stop-loss{drop}", trades)
                 self._cleanup_position(coin)
                 continue
 
             # Check time exit
             if self._check_time_exit(coin):
-                self._execute_sell(coin, held, trades, "time-limit")
+                self._execute_sell(coin, held, f"time-limit (held {self.position_max_days}+ days)", trades)
                 self._cleanup_position(coin)
                 continue
 
             # Regular sell signal
             hybrid = hybrid_scores.get(coin, 0.0)
             if hybrid <= self.sell_threshold and self._can_trade(coin):
-                self._execute_sell(coin, held, trades, f"hybrid={hybrid:.2f}")
+                self._execute_sell(coin, held, f"hybrid={hybrid:+.2f} <= sell threshold {self.sell_threshold:+.2f}", trades)
                 self._cleanup_position(coin)
 
-        # BUY logic with portfolio allocation
+        # BUY logic with portfolio allocation. Trades are returned in simulation too:
+        # TradingBot is what declines to place them, and returning nothing here made a
+        # simulating bot indistinguishable from one that never wanted to trade.
         if base_balance < 10:
-            return trades if not self.simulate_only else []
+            return trades
 
         # Separate core and opportunistic candidates
         core_candidates = [
@@ -174,13 +197,14 @@ class DiversifiedPortfolioStrategy(LlamaHybridStrategy):
         if core_candidates:
             core_candidates.sort(key=lambda x: x[1], reverse=True)
             top_coin, top_score = core_candidates[0]
+            reason = f"hybrid={top_score:+.2f} >= buy threshold {self.buy_threshold:+.2f} (core)"
 
-            if self.require_trend_confirmation:
-                trend = trend_scores.get(top_coin)
-                if trend is not None and trend < 0:
-                    self.logger.info(f"Skipping {top_coin}: negative trend")
-                else:
-                    self._execute_buy_with_tracking(top_coin, core_funds, trades)
+            trend = trend_scores.get(top_coin)
+            if self.require_trend_confirmation and trend is not None and trend < 0:
+                self.logger.info(f"Skipping {top_coin}: negative trend")
+            else:
+                # (Without trend confirmation this used to buy nothing at all.)
+                self._execute_buy_with_tracking(top_coin, core_funds, trades, reason=reason)
 
         # Buy best opportunistic coin (smaller position)
         if opportunistic_candidates:
@@ -192,43 +216,13 @@ class DiversifiedPortfolioStrategy(LlamaHybridStrategy):
             if trend is not None and trend < 0:
                 self.logger.info(f"Skipping {top_coin}: negative trend (opportunistic)")
             else:
-                self._execute_buy_with_tracking(top_coin, opportunistic_funds, trades)
+                self._execute_buy_with_tracking(
+                    top_coin, opportunistic_funds, trades,
+                    reason=f"hybrid={top_score:+.2f} >= buy threshold {self.buy_threshold:+.2f} (opportunistic)",
+                )
 
-        return trades if not self.simulate_only else []
+        return trades
 
-    def _execute_buy_with_tracking(self, coin: str, amount: float, trades: List[TradeInstruction]) -> None:
-        """Execute buy and track entry price/time."""
-        trades: list[TradeInstruction] = []
-
-        current_price = self._get_current_price(coin)
-        if not current_price:
-            return
-
-        min_trade = getattr(__import__('config'), "MIN_TRADE_USD", 10.0)
-        if amount < min_trade:
-            return
-
-        success = self._execute_buy(coin, amount, current_price, trades)
-        if success:
-            # Track entry for risk management
-            self.entry_prices[coin] = current_price
-            self.entry_times[coin] = datetime.now(timezone.utc)
-
-            self.positions[coin] = {
-                "entry_price": current_price,
-                "amount": amount / current_price,
-                "entry_time": self.entry_times[coin].isoformat()
-            }
-            self.last_trade_time[coin] = time.time()
-
-            coin_type = "CORE" if coin in self.core_coins else "OPPORTUNISTIC"
-            self.logger.info(f"[{coin_type}] Bought {coin} at ${current_price:.4f}")
-
-    def _cleanup_position(self, coin: str) -> None:
-        """Clean up tracking data after exit."""
-        if coin in self.positions:
-            del self.positions[coin]
-        if coin in self.entry_prices:
-            del self.entry_prices[coin]
-        if coin in self.entry_times:
-            del self.entry_times[coin]
+    # _execute_buy_with_tracking and _cleanup_position live in LlamaHybridStrategy. The copy
+    # that was here shadowed `trades` with a fresh local list, so every buy it queued was
+    # thrown away.

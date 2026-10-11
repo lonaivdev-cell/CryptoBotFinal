@@ -12,6 +12,60 @@ try:
 except Exception:
     pass
 
+
+# ──────────────────────────────────────────────────────────────
+# Environment helpers. Every default below is the value this file had before it read the
+# environment, so an empty environment behaves exactly as the hard-coded config did. A value
+# that does not parse falls back to the default instead of crashing the bot at import time.
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # NaN and infinity compare false against every threshold, which would silently disable
+    # the strategy rather than fail.
+    return value if value == value and value not in (float("inf"), float("-inf")) else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_coins(name: str, default: list) -> list:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return list(default)
+    coins = []
+    for part in raw.replace(",", " ").replace(";", " ").split():
+        coin = part.strip().upper()
+        # Symbols end up in "COIN/USDT" market names and in prompts; anything that is not a
+        # plain ticker is dropped rather than passed through.
+        if 2 <= len(coin) <= 15 and coin.isalnum() and coin not in coins:
+            coins.append(coin)
+    return coins or list(default)
+
+
 # ──────────────────────────────────────────────────────────────
 # Exchange
 EXCHANGE_ID   = os.getenv("EXCHANGE_ID", "binance")
@@ -30,7 +84,19 @@ LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 # LLaMA / Ollama
 LLAMA_ENABLED = True
 LLAMA_MODEL_NAME      = os.getenv("LLAMA_MODEL_NAME", "llama3.1:8b-instruct-q4_K_M").split("=", 1)[-1].strip()
-LLAMA_API_BASE_URL    = os.getenv("LLAMA_API_BASE_URL", "http://localhost:11434/api")
+# "ollama" (the default: POST {base}/generate) or "openai" (POST {base}/chat/completions, as
+# served by llama.cpp's llama-server, vLLM, LM Studio…). On loserver the bot shares the
+# llama-server the Lo's Server agent uses: LLAMA_API_STYLE=openai,
+# LLAMA_API_BASE_URL=http://127.0.0.1:8080/v1.
+LLAMA_API_STYLE       = os.getenv("LLAMA_API_STYLE", "ollama").strip().lower() or "ollama"
+LLAMA_API_BASE_URL    = os.getenv("LLAMA_API_BASE_URL", "").strip() or (
+    "http://127.0.0.1:8080/v1" if LLAMA_API_STYLE == "openai" else "http://localhost:11434/api"
+)
+# Bearer token for an OpenAI-style server started with --api-key; empty means none is sent.
+LLAMA_API_KEY         = os.getenv("LLAMA_API_KEY", "").strip()
+# Qwen3-family models think before answering unless told not to, and a 32-token budget is all
+# thinking and no score. Sent as chat_template_kwargs.enable_thinking=false (OpenAI style only).
+LLAMA_DISABLE_THINKING = _env_bool("LLAMA_DISABLE_THINKING", True)
 LLAMA_SYSTEM_PROMPT   = os.getenv("LLAMA_SYSTEM_PROMPT", "").strip()
 LLAMA_KEEP_ALIVE      = os.getenv("LLAMA_KEEP_ALIVE", "2h")
 LLAMA_REQUEST_TIMEOUT = int(os.getenv("LLAMA_REQUEST_TIMEOUT", "45"))
@@ -76,8 +142,8 @@ HYBRID_TREND_WEIGHT     = 0.4
 HYBRID_REQUIRE_TREND_CONFIRMATION = False
 
 # Trade thresholds / sizing
-SENTIMENT_BUY_THRESHOLD   = 0.45
-SENTIMENT_SELL_THRESHOLD  = -0.40
+SENTIMENT_BUY_THRESHOLD   = _env_float("SENTIMENT_BUY_THRESHOLD", 0.45)
+SENTIMENT_SELL_THRESHOLD  = _env_float("SENTIMENT_SELL_THRESHOLD", -0.40)
 SENTIMENT_TRADE_FRACTION  = 0.50
 # Min trade value
 MIN_TRADE_USD             = float(os.getenv("MIN_TRADE_USD", "5.0"))
@@ -85,11 +151,11 @@ MIN_TRADE_USD             = float(os.getenv("MIN_TRADE_USD", "5.0"))
 # ═══════════════════════════════════════════════════════════════════
 # STRATEGY SELECTION
 # ═══════════════════════════════════════════════════════════════════
-USE_PORTFOLIO_STRATEGY = True  # Set True to enable risk management features
+USE_PORTFOLIO_STRATEGY = _env_bool("USE_PORTFOLIO_STRATEGY", True)  # Set True to enable risk management features
 
 # Portfolio strategy settings (only used if USE_PORTFOLIO_STRATEGY=True)
-STOP_LOSS_PCT = 0.15  # Exit position if down 20%
-POSITION_MAX_DAYS = 10  # Auto-exit opportunistic positions after 14 days
+STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.15)  # Exit position if down 15%
+POSITION_MAX_DAYS = _env_int("POSITION_MAX_DAYS", 10)  # Auto-exit opportunistic positions after 10 days
 ENABLE_STOP_LOSS = True  # Enable stop-loss protection
 ENABLE_TIME_EXIT = True  # Enable time-based exits
 
@@ -97,21 +163,21 @@ ENABLE_TIME_EXIT = True  # Enable time-based exits
 # SENTIMENT OPTIMIZATION (Rolling Scheduler)
 # ═══════════════════════════════════════════════════════════════════
 SENTIMENT_ROLLING_ENABLED = True  # Enable background AI scheduler
-SENTIMENT_TTL_SECONDS = 240  # 🔹 CHANGED: 3 minutes (was 900 = 15 min)
-SENTIMENT_MAX_QPS = 0.25  # 🔹 CHANGED: Faster (was 0.25)
+SENTIMENT_TTL_SECONDS = _env_int("SENTIMENT_TTL_SECONDS", 240)  # 🔹 CHANGED: 4 minutes (was 900 = 15 min)
+SENTIMENT_MAX_QPS = _env_float("SENTIMENT_MAX_QPS", 0.25)  # 🔹 CHANGED: Faster (was 0.25)
 SENTIMENT_BATCH_SIZE = 1  # Coins per request (1 = safer, 2-3 = faster)
 SENTIMENT_ROTATE_ORDER = "staleness"  # "staleness" or "round_robin"
 SENTIMENT_ENABLE_JITTER = True  # Add random timing jitter
 SENTIMENT_ADAPTIVE_RATE = True  # Adapt QPS based on GPU speed
 
 # Sentiment coins to track
-SENTIMENT_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"]
+SENTIMENT_COINS = _env_coins("SENTIMENT_COINS", ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"])
 
 # ═══════════════════════════════════════════════════════════════════
 # HYBRID STRATEGY WEIGHTS
 # ═══════════════════════════════════════════════════════════════════
-SENTIMENT_WEIGHT = 0.6  # Weight for AI sentiment (60%)
-TREND_WEIGHT = 0.4  # Weight for technical trend (40%)
+SENTIMENT_WEIGHT = _env_float("SENTIMENT_WEIGHT", 0.6)  # Weight for AI sentiment (60%)
+TREND_WEIGHT = _env_float("TREND_WEIGHT", 0.4)  # Weight for technical trend (40%)
 REQUIRE_TREND_CONFIRMATION = True  # Block buys if trend is negative
 MIN_SENTIMENT_DELTA = 0.12  # Minimum change to log (reduces noise)
 
@@ -183,7 +249,7 @@ NOW RATE THESE COINS:
 
 # ───────────────── Opportunistic scalper (quick trades) ─────────────────
 OPP_ENABLED = True                       # master switch
-OPP_BASE_NOTIONAL_USD = 15.0             # how much USDT to use per quick trade
+OPP_BASE_NOTIONAL_USD = _env_float("OPP_BASE_NOTIONAL_USD", 15.0)  # how much USDT to use per quick trade
 OPP_TP_PCT = 0.0025                      # +0.25% take-profit (fee-aware)
 OPP_SL_PCT = 0.0030                      # −0.30% stop-loss (tight)
 OPP_MAX_SPREAD_PCT = 0.0015              # 0.15% max bid/ask spread to enter
@@ -200,7 +266,10 @@ COOLDOWN_SECONDS  = 180
 # Convert API is optional; disable by default to avoid 400s unless your API key
 # has Convert permissions and the endpoint is fully enabled for your account.
 LLAMA_SENTIMENT_USE_CONVERT   = True
-LLAMA_SENTIMENT_SIMULATE_ONLY = True  # True = do not actually place orders
+# Master safety switch: True = do not actually place orders. Only an explicit false word
+# ("False", "0", "no", "off") in the environment turns it off; a typo keeps simulation on.
+# The headless service (headless.py) additionally requires CRYPTOBOT_ALLOW_LIVE=1 and real keys.
+LLAMA_SENTIMENT_SIMULATE_ONLY = _env_bool("LLAMA_SENTIMENT_SIMULATE_ONLY", True)
 
 # GUI defaults (optional)
 GUI_SHOW_TOTAL_LINE = os.getenv("GUI_SHOW_TOTAL_LINE", "True").lower() == "true"

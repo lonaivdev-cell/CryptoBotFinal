@@ -1,0 +1,89 @@
+# Lo's Server crypto bot — CryptoBotFinal's headless service (headless.py).
+#
+# Installed by deploy/install.sh; see deploy/README.md. It serves the control API on
+# 127.0.0.1:8097 for the Lo's Server agent and simulates trades unless a human enables live
+# trading in /etc/lo-cryptobot/cryptobot.env. Everything below ExecStart is a restriction: the
+# bot needs the network (Binance, the local model) and its own state directory, nothing else.
+#
+# `systemd-analyze security lo-cryptobot` scores what is here.
+
+[Unit]
+Description=Lo's Server crypto bot (headless CryptoBot, loopback control API)
+Documentation=file:///opt/lo-cryptobot/app/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cryptobot
+Group=cryptobot
+WorkingDirectory=/opt/lo-cryptobot/app
+ExecStart=/opt/lo-cryptobot/venv/bin/python /opt/lo-cryptobot/app/headless.py
+Restart=on-failure
+RestartSec=10
+# Exit status 2 is a setting the human must fix (a non-loopback bind, a bad LLAMA_API_STYLE…):
+# restarting would only repeat the same sentence in the journal every ten seconds.
+RestartPreventExitStatus=2
+TimeoutStopSec=30
+
+# The keys and every setting. Read by systemd (as root) before the bot starts, so the file can
+# be 0600 root:root: the bot gets the values in its environment but cannot read or rewrite the
+# file, and the agent's user cannot read it at all.
+EnvironmentFile=/etc/lo-cryptobot/cryptobot.env
+# Paths that must match the sandbox below. (EnvironmentFile wins over these, so leave them out
+# of the .env.)
+Environment=CRYPTOBOT_ENV_FILE=/etc/lo-cryptobot/cryptobot.env
+Environment=CRYPTOBOT_STATE_DIR=/var/lib/lo-cryptobot
+Environment=CRYPTOBOT_LOG_DIR=/var/log/lo-cryptobot
+Environment=PYTHONUNBUFFERED=1
+# /opt/lo-cryptobot is root-owned and read-only; install.sh byte-compiles it in advance.
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+
+# --- Privileges: none, and no way to get any -------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+# --- Filesystem --------------------------------------------------------------------------
+# Read-only everywhere except its state (paper wallet, decision log) and log directories.
+ProtectSystem=strict
+ProtectHome=yes
+StateDirectory=lo-cryptobot
+StateDirectoryMode=0750
+LogsDirectory=lo-cryptobot
+LogsDirectoryMode=0750
+ReadWritePaths=/var/lib/lo-cryptobot /var/log/lo-cryptobot
+PrivateTmp=yes
+PrivateDevices=yes
+
+# --- Kernel, processes and namespaces ----------------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# Checked against ccxt, requests and ssl under the kernel's PR_SET_MDWE: nothing here needs
+# writable-and-executable memory.
+MemoryDenyWriteExecute=yes
+# inet for Binance and the model; unix for journald; netlink because glibc's resolver asks it
+# which address families are configured.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# --- Resources ---------------------------------------------------------------------------
+# The model runs in llama-server, not here; this is an HTTP server, a loop and some JSON.
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
